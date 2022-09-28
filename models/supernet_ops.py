@@ -31,21 +31,22 @@ class SuperConv2d(nn.Module):
         self.padding = padding if padding is not None else max_kernel_size // 2
 
         channel_masks = []
-        prev_out_channels = None
+        # prev_out_channels = None
         for out_channels in out_channels_list:
-            channel_mask = torch.ones(max_out_channels)
-            channel_mask *= nn.functional.pad(torch.ones(out_channels), [0, max_out_channels - out_channels], value=0)
-            if prev_out_channels:
-                channel_mask *= nn.functional.pad(torch.zeros(prev_out_channels), [0, max_out_channels - prev_out_channels], value=1)
+            # channel_mask = torch.ones(max_out_channels)
+            channel_mask = nn.functional.pad(torch.ones(out_channels), [0, max_out_channels - out_channels], value=0)
+            # if prev_out_channels:
+            #     channel_mask *= nn.functional.pad(torch.zeros(prev_out_channels), [0, max_out_channels - prev_out_channels], value=1)
             channel_mask = channel_mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-            prev_out_channels = out_channels
+            # prev_out_channels = out_channels
             channel_masks.append(channel_mask)
 
         self.register_buffer('channel_masks', torch.stack(channel_masks, dim=0) if out_channels_list else None)
-        self.register_parameter('channel_thresholds', nn.Parameter(torch.zeros(len(out_channels_list))) if out_channels_list else None)
+        self.register_parameter('channel_scores', nn.Parameter(torch.zeros(len(out_channels_list))) if out_channels_list else None)
+    
 
         kernel_masks = []
-        prev_kernel_size = None
+
         for kernel_size in kernel_size_list:
             if kernel_size == "dilated":
                 kernel_mask = torch.zeros(max_kernel_size, max_kernel_size)
@@ -54,14 +55,11 @@ class SuperConv2d(nn.Module):
             else:
                 kernel_mask = torch.ones(max_kernel_size, max_kernel_size)
                 kernel_mask *= nn.functional.pad(torch.ones(kernel_size, kernel_size), [(max_kernel_size - kernel_size) // 2] * 4, value=0)
-                if prev_kernel_size:
-                    kernel_mask *= nn.functional.pad(torch.zeros(prev_kernel_size, prev_kernel_size), [(max_kernel_size - prev_kernel_size) // 2] * 4, value=1)
                 kernel_mask = kernel_mask.unsqueeze(0).unsqueeze(0)
-                prev_kernel_size = kernel_size
                 kernel_masks.append(kernel_mask)
 
         self.register_buffer('kernel_masks', torch.stack(kernel_masks, dim=0) if kernel_size_list else None)
-        self.register_parameter('kernel_thresholds', nn.Parameter(torch.zeros(len(kernel_size_list))) if kernel_size_list else None)
+        self.register_parameter('kernel_scores', nn.Parameter(torch.zeros(len(kernel_size_list), max_kernel_size, max_kernel_size)) if kernel_size_list else None)
 
         self.register_parameter('weight', nn.Parameter(torch.Tensor(max_out_channels, in_channels // groups, max_kernel_size, max_kernel_size)))
         nn.init.kaiming_normal_(self.weight, mode='fan_out')
@@ -71,45 +69,55 @@ class SuperConv2d(nn.Module):
         self.max_out_channels = max_out_channels
         self.max_kernel_size = max_kernel_size
 
-    def forward(self, input):
+    def forward(self, input, prev_ch=None):
         weight = self.weight
-        if self.channel_masks is not None and self.channel_thresholds is not None:
-            weight = weight * self.parametrized_mask(list(self.channel_masks), list(self.channel_thresholds))
-        if self.kernel_masks is not None and self.kernel_thresholds is not None:
-            weight = weight * self.parametrized_mask(list(self.kernel_masks), list(self.kernel_thresholds))
+        # gumbel softmax
+        if self.channel_masks is not None and self.channel_scores is not None:
+            scores = nn.functional.gumbel_softmax(self.channel_scores, tau=0.1, hard=True)
+            mask = self.channel_masks * scores.view(-1, 1, 1, 1, 1)
+            weight = weight * mask.sum(dim=0)
+
+        if self.kernel_masks is not None and self.kernel_scores is not None:
+            mask = self.kernel_masks * torch.sigmoid(self.kernel_scores).unsqueeze(1).unsqueeze(1)
+            weight = weight * mask.sum(dim=0)
+
+        # torch.norm(self.kernel_scores, dim=(1,2))
         return nn.functional.conv2d(input, weight, self.bias, padding=self.padding, stride=self.stride, dilation=self.dilation, groups=self.groups)
 
-    def parametrized_mask(self, masks, thresholds):
-        if not masks or not thresholds:
-            return 0
-        mask = masks.pop(0)
-        threshold = thresholds.pop(0)
-        norm = torch.norm(self.weight * mask)
-        indicator = (norm > threshold).float() - torch.sigmoid(norm - threshold).detach() + torch.sigmoid(norm - threshold)
-        return indicator * (mask + self.parametrized_mask(masks, thresholds))
+    def parametrized_mask(self, masks, scores):
+        new_masks = []
+        for m, s in zip(masks, scores):  # shape = (5,5), 더 효율적으로 구현할 수 있 => stack 이용
+            new_masks.append(m * torch.sigmoid(s))
+
+        return torch.cat(new_masks, dim=0).sum(dim=0)
 
     def freeze_weight(self):
         weight = self.weight
-        if self.channel_masks is not None and self.channel_thresholds is not None:
-            prev_out_channels = None
-            for channel_mask, channel_threshold, out_channels in zip(self.channel_masks, self.channel_thresholds, self.out_channels_list):
-                if prev_out_channels:
-                    channel_norm = torch.norm(self.weight * channel_mask)
-                    if channel_norm < channel_threshold:
-                        weight = weight[..., :prev_out_channels]
-                        break
-                prev_out_channels = out_channels
-        if self.kernel_masks is not None and self.kernel_thresholds is not None:
-            prev_kernel_size = None
-            for kernel_mask, kernel_threshold, kernel_size in zip(self.kernel_masks, self.kernel_thresholds, self.kernel_size_list):
-                if prev_kernel_size:
-                    kernel_norm = torch.norm(self.weight * kernel_mask)
-                    if kernel_norm < kernel_threshold:
-                        cut = (self.max_kernel_size - prev_kernel_size) // 2
-                        weight = weight[..., cut:-cut, cut:-cut]
-                        break
-                prev_kernel_size = kernel_size
-        self.weight = weight
+        # if self.channel_masks is not None and self.channel_thresholds is not None:
+        #     prev_out_channels = None
+        #     for channel_mask, channel_threshold, out_channels in zip(self.channel_masks, self.channel_thresholds, self.out_channels_list):
+        #         if prev_out_channels:
+        #             channel_norm = torch.norm(self.weight * channel_mask)
+        #             if channel_norm < channel_threshold:
+        #                 weight = weight[..., :prev_out_channels]
+        #                 break
+        #         prev_out_channels = out_channels
+        # if self.kernel_masks is not None and self.kernel_thresholds is not None:
+        #     prev_kernel_size = None
+        #     for kernel_mask, kernel_threshold, kernel_size in zip(self.kernel_masks, self.kernel_thresholds, self.kernel_size_list):
+        #         if prev_kernel_size:
+        #             kernel_norm = torch.norm(self.weight * kernel_mask)
+        #             if kernel_norm < kernel_threshold:
+        #                 cut = (self.max_kernel_size - prev_kernel_size) // 2
+        #                 weight = weight[..., cut:-cut, cut:-cut]
+        #                 break
+        #         prev_kernel_size = kernel_size
+
+        norms = torch.norm(self.kernel_scores, dim=(1,2))
+        idx = torch.argmax(norms)
+        # idx=0 -> 1x1, idx=1 -> 3x3, idx=2 -> 5x5, idx=3 -> dilated
+        # self.weight = nn.Conv
+
 
 
 class SuperBottleneck(nn.Module):
