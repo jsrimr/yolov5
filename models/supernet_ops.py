@@ -59,7 +59,8 @@ class SuperConv2d(nn.Module):
                 kernel_masks.append(kernel_mask)
 
         self.register_buffer('kernel_masks', torch.stack(kernel_masks, dim=0) if kernel_size_list else None)
-        self.register_parameter('kernel_scores', nn.Parameter(torch.zeros(len(kernel_size_list), max_kernel_size, max_kernel_size)) if kernel_size_list else None)
+        # self.register_parameter('kernel_scores', nn.Parameter(torch.zeros(len(kernel_size_list), max_kernel_size, max_kernel_size)) if kernel_size_list else None)
+        self.register_parameter('kernel_scores', nn.Parameter(torch.zeros(len(kernel_size_list))) if kernel_size_list else None)
 
         self.register_parameter('weight', nn.Parameter(torch.Tensor(max_out_channels, in_channels // groups, max_kernel_size, max_kernel_size)))
         nn.init.kaiming_normal_(self.weight, mode='fan_out')
@@ -74,22 +75,18 @@ class SuperConv2d(nn.Module):
         # gumbel softmax
         if self.channel_masks is not None and self.channel_scores is not None:
             scores = nn.functional.gumbel_softmax(self.channel_scores, tau=0.1, hard=True)
-            mask = self.channel_masks * scores.view(-1, 1, 1, 1, 1)
+            mask = self.channel_masks * scores.view(-1, 1, 1, 1, 1)  # (2, 1,1,1) * (2, 1, 1, 1)
             weight = weight * mask.sum(dim=0)
 
         if self.kernel_masks is not None and self.kernel_scores is not None:
-            mask = self.kernel_masks * torch.sigmoid(self.kernel_scores).unsqueeze(1).unsqueeze(1)
+            mask = self.kernel_masks * torch.sigmoid(self.kernel_scores).view(-1, 1, 1, 1, 1)  # (4,1,1,5,5) * (4,1,1) => (4,1,1,5,5)
             weight = weight * mask.sum(dim=0)
 
-        # torch.norm(self.kernel_scores, dim=(1,2))
         return nn.functional.conv2d(input, weight, self.bias, padding=self.padding, stride=self.stride, dilation=self.dilation, groups=self.groups)
 
-    def parametrized_mask(self, masks, scores):
-        new_masks = []
-        for m, s in zip(masks, scores):  # shape = (5,5), 더 효율적으로 구현할 수 있 => stack 이용
-            new_masks.append(m * torch.sigmoid(s))
-
-        return torch.cat(new_masks, dim=0).sum(dim=0)
+    # def parametrized_mask(self, masks, scores):
+    #     mask = masks * scores
+    #     return mask.sum(dim=0)
 
     def freeze_weight(self):
         weight = self.weight
